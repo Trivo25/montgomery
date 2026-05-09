@@ -242,11 +242,38 @@ async function createWeierstraß(
     let scalarsInputPtr = Scalar.global.getPointer(N * packedScalar);
     Scalar.memoryBytes.set(scalarBytes, scalarsInputPtr);
 
-    // decode into the on-curve internal layout (Montgomery form for points)
+    // decode into the on-curve internal layout (Montgomery form for points).
+    // we don't use `pointsFromBytes` / `scalarsFromBytes` here — those use
+    // `range(N)` to partition across threads and would only process this
+    // thread's slice. the sync API runs on the main thread alone, so we
+    // walk the full [0, N) range explicitly.
     let pointPtr = Field.global.getPointer(N * Affine.size);
-    pointsFromBytes(pointPtr, pointsInputPtr, N);
     let scalarPtr = Scalar.global.getPointer(N * Scalar.sizeField);
-    scalarsFromBytes(scalarPtr, scalarsInputPtr, N);
+    let sizeAffineLocal = Affine.size;
+    for (
+      let i = 0,
+        pi = pointPtr,
+        bi = pointsInputPtr;
+      i < N;
+      i++, pi += sizeAffineLocal, bi += bytesPerPoint
+    ) {
+      let x = pi;
+      let y = x + Field.sizeField;
+      Field.memoryBytes[pi + 2 * Field.sizeField] = 1;
+      Field.fromPackedBytes(x, bi);
+      Field.fromPackedBytes(y, bi + packedField);
+      Field.toMontgomery(x);
+      Field.toMontgomery(y);
+    }
+    for (
+      let i = 0,
+        si = scalarPtr,
+        bi = scalarsInputPtr;
+      i < N;
+      i++, si += Scalar.sizeField, bi += packedScalar
+    ) {
+      Scalar.fromPackedBytes(si, bi);
+    }
 
     // run the optimized single-thread MSM (synchronous)
     let resultProjective = msmSync(scalarPtr, pointPtr, N);

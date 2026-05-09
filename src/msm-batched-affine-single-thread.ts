@@ -115,7 +115,6 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
     getPointers,
     sizeField,
     memoryBytes,
-    getZeroPointers,
     resetPointers,
     constants,
     fromMontgomery,
@@ -124,6 +123,16 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
     getPointersInMemory,
     getEmptyPointersInMemory,
   } = Field;
+
+  // sync-safe zero pointers: getPointers + manual fill on global memory.
+  // Field.getZeroPointers asserts !isParallel(), but this MSM only runs on the
+  // main thread synchronously — no workers ever touch these slots — so the
+  // shared-memory race that assertion guards against can't happen here.
+  function getZeroPointers(N: number, size: number) {
+    let pointers = getPointers(N, size);
+    memoryBytes.fill(0, pointers[0], pointers[0] + N * size);
+    return pointers;
+  }
 
   let {
     decompose,
