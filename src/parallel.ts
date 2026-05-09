@@ -1,33 +1,34 @@
-import type * as _W from "wasmati";
-import { type WasmArtifacts } from "./types.ts";
-import { createMsmField } from "./field-msm.ts";
-import { createCurveProjective } from "./curve-projective.ts";
+import type * as _W from 'wasmati';
+import { type WasmArtifacts } from './types.ts';
+import { createMsmField } from './field-msm.ts';
+import { createCurveProjective } from './curve-projective.ts';
 import {
   createCurveProjective as createBigintCurve,
   type BigintPoint as ProjectivePoint,
-} from "./bigint/projective-weierstrass.ts";
-import { createCurveAffine as createBigintAffine } from "./bigint/affine-weierstrass.ts";
-import { createCurveAffine } from "./curve-affine.ts";
-import { msm as bigintMsm } from "./bigint/msm.ts";
+} from './bigint/projective-weierstrass.ts';
+import { createCurveAffine as createBigintAffine } from './bigint/affine-weierstrass.ts';
+import { createCurveAffine } from './curve-affine.ts';
+import { msm as bigintMsm } from './bigint/msm.ts';
 import {
   createRandomPointsFast,
   createRandomPointsFastSingleCurve,
   createRandomScalars,
-} from "./curve-random.ts";
-import { type GlvScalarParams, createGlvScalar } from "./scalar-glv.ts";
-import { createMsm } from "./msm-batched-affine.ts";
-import { pool } from "./threads/global-pool.ts";
-import { type CurveParams } from "./bigint/affine-weierstrass.ts";
-import { type CurveParams as TwistedEdwardsParams } from "./bigint/twisted-edwards.ts";
-import { assert } from "./util.ts";
-import { createScalar } from "./scalar-simple.ts";
-import { createCurveTwistedEdwards } from "./curve-twisted-edwards.ts";
+} from './curve-random.ts';
+import { type GlvScalarParams, createGlvScalar } from './scalar-glv.ts';
+import { createMsm } from './msm-batched-affine.ts';
+import { createMsm as createMsmSync } from './msm-batched-affine-single-thread.ts';
+import { pool } from './threads/global-pool.ts';
+import { type CurveParams } from './bigint/affine-weierstrass.ts';
+import { type CurveParams as TwistedEdwardsParams } from './bigint/twisted-edwards.ts';
+import { assert } from './util.ts';
+import { createScalar } from './scalar-simple.ts';
+import { createCurveTwistedEdwards } from './curve-twisted-edwards.ts';
 import {
   createCurveTwistedEdwards as createBigintTE,
   type BigintPoint as TwistedEdwardsPoint,
-} from "./bigint/twisted-edwards.ts";
-import { createMsmBasic, msmBasic } from "./msm-basic.ts";
-import { barrier, range } from "./threads/threads.ts";
+} from './bigint/twisted-edwards.ts';
+import { createMsmBasic, msmBasic } from './msm-basic.ts';
+import { barrier, range } from './threads/threads.ts';
 
 export { startThreads, stopThreads, Weierstraß, TwistedEdwards };
 
@@ -83,8 +84,8 @@ async function createWeierstraß(
   scalarWasm?: { wasm: WasmArtifacts; fullParams: GlvScalarParams },
 ) {
   let { modulus: p, order: q, endomorphism, a, b, label, cofactor: h } = params;
-  assert(a === 0n, "only curves with a = 0 are supported");
-  assert(endomorphism !== undefined, "endomorphism required");
+  assert(a === 0n, 'only curves with a = 0 are supported');
+  assert(endomorphism !== undefined, 'endomorphism required');
   let { beta, lambda } = endomorphism;
 
   // create modules
@@ -103,6 +104,7 @@ async function createWeierstraß(
   const randomScalars = createRandomScalars(Inputs);
 
   const { msm, msmUnsafe } = createMsm(Inputs);
+  const { msm: msmSync } = createMsmSync(Inputs);
 
   const InputsProjective = { Field, Scalar: Scalar.Simple, Curve: Projective };
 
@@ -188,6 +190,88 @@ async function createWeierstraß(
     }
   }
 
+  /**
+   * Synchronous MSM
+   *
+   * Inputs:
+   * - `pointsBytes`: affine points as `x_0 || y_0 || ... || x_{N-1} || y_{N-1}`,
+   *   each coord packed little-endian to `Field.packedSizeField` bytes
+   *   (32 for Pasta). Total length must be `2 * packedSizeField * N`.
+   * - `scalarBytes`: scalars packed little-endian to `Scalar.packedSizeField`
+   *   bytes (32 for Pasta). Total length must be `packedSizeField * N`.
+   *
+   * Output: 64 bytes for Pasta (`x || y`, packed LE), all-zero for the
+   * point at infinity. `N === 0` returns the all-zero encoding.
+   *
+   * Reuses the optimized single-threaded batched-affine MSM
+   * (see {@link createMsmSync}). Does not require a worker pool.
+   */
+  function msmAffineBytes(
+    pointsBytes: Uint8Array,
+    scalarBytes: Uint8Array,
+  ): Uint8Array {
+    let packedField = Field.packedSizeField;
+    let packedScalar = Scalar.packedSizeField;
+    let bytesPerPoint = 2 * packedField;
+
+    assert(
+      pointsBytes.length % bytesPerPoint === 0,
+      `msmAffineBytes: expected pointsBytes.length divisible by ${bytesPerPoint}, got ${pointsBytes.length}`,
+    );
+    assert(
+      scalarBytes.length % packedScalar === 0,
+      `msmAffineBytes: expected scalarBytes.length divisible by ${packedScalar}, got ${scalarBytes.length}`,
+    );
+    let N = pointsBytes.length / bytesPerPoint;
+    let Ns = scalarBytes.length / packedScalar;
+    assert(
+      N === Ns,
+      `msmAffineBytes: point/scalar count mismatch (points=${N}, scalars=${Ns})`,
+    );
+
+    let out = new Uint8Array(bytesPerPoint);
+    if (N === 0) return out;
+
+    using _g = Field.global.atCurrentOffset;
+    using _l = Field.local.atCurrentOffset;
+    using _s = Scalar.global.atCurrentOffset;
+
+    // copy input bytes into wasm memory
+    let pointsInputPtr = Field.global.getPointer(N * bytesPerPoint);
+    Field.memoryBytes.set(pointsBytes, pointsInputPtr);
+    let scalarsInputPtr = Scalar.global.getPointer(N * packedScalar);
+    Scalar.memoryBytes.set(scalarBytes, scalarsInputPtr);
+
+    // decode into the on-curve internal layout (Montgomery form for points)
+    let pointPtr = Field.global.getPointer(N * Affine.size);
+    pointsFromBytes(pointPtr, pointsInputPtr, N);
+    let scalarPtr = Scalar.global.getPointer(N * Scalar.sizeField);
+    scalarsFromBytes(scalarPtr, scalarsInputPtr, N);
+
+    // run the optimized single-thread MSM (synchronous)
+    let resultProjective = msmSync(scalarPtr, pointPtr, N);
+
+    if (Projective.isZero(resultProjective)) return out;
+
+    // projective -> affine, then pack to LE bytes
+    let scratch = Field.local.getPointers(5);
+    let [x, y, z] = Projective.coords(resultProjective);
+    let zinv = scratch[0];
+    Field.inverse(scratch[1], zinv, z);
+    Field.multiply(x, x, zinv);
+    Field.multiply(y, y, zinv);
+    Field.fromMontgomery(x);
+    Field.fromMontgomery(y);
+
+    let outPtr = Field.global.getPointer(bytesPerPoint);
+    Field.toPackedBytes(outPtr, x);
+    Field.toPackedBytes(outPtr + packedField, y);
+    out.set(Field.memoryBytes.subarray(outPtr, outPtr + bytesPerPoint));
+    return out;
+  }
+
+  const Sync = { msmAffineBytes };
+
   const Parallel = pool.register(`Weierstraß, ${label}`, {
     randomPointsFast,
     randomScalars,
@@ -218,6 +302,7 @@ async function createWeierstraß(
     Affine,
     Projective,
     Parallel,
+    Sync,
     Bigint,
   };
 
@@ -429,5 +514,5 @@ async function stopThreads() {
 // registered after the function declarations above so that keepNames-inserted
 // `.name` patches have run and `createWeierstraß.name === "createWeierstraß"`
 // (see comment at the top of this file)
-pool.register("Weierstraß", createWeierstraß);
-pool.register("Twisted Edwards", createTwistedEdwards);
+pool.register('Weierstraß', createWeierstraß);
+pool.register('Twisted Edwards', createTwistedEdwards);

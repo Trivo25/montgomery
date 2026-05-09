@@ -1,5 +1,11 @@
 /**
- * DEPRECATED. The current implementation, which supports multi-threading, is in `msm-batched-affine.ts`
+ * Single-threaded variant of the batched-affine MSM.
+ *
+ * The multi-threaded variant in `msm-batched-affine.ts` is the one used by
+ * the async parallel API. This file is the synchronous equivalent — same
+ * algorithm (batched-affine + GLV + reduceBucketsAffine), same 9-limb / 29-bit
+ * wasm field — used by the synchronous MSM API exposed on `Curve.Sync` for
+ * code that cannot await Promises.
  */
 import {
   type CurveAffine,
@@ -7,11 +13,11 @@ import {
   batchAddUnsafe,
   batchDoubleInPlace,
   getSizeAffine,
-} from "./curve-affine.ts";
-import { type CurveProjective } from "./curve-projective.ts";
-import { type MsmField } from "./field-msm.ts";
-import { type GlvScalar } from "./scalar-glv.ts";
-import { log2 } from "./util.ts";
+} from './curve-affine.ts';
+import { type CurveProjective } from './curve-projective.ts';
+import { type MsmField } from './field-msm.ts';
+import { type GlvScalar } from './scalar-glv.ts';
+import { log2 } from './util.ts';
 
 export { createMsm, type MsmCurve, type BigintPoint, type BytesPoint };
 
@@ -145,11 +151,11 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
     inputPoints: BigintPoint[],
     options:
       | { c?: number; c0?: number; useSafeAdditions?: boolean }
-      | undefined = {}
+      | undefined = {},
   ) {
     let N = inputPoints.length;
     if (inputScalars.length !== N) {
-      throw Error("Mismatch of scalar/point array length");
+      throw Error('Mismatch of scalar/point array length');
     }
 
     // transfer scalars to wasm memory
@@ -176,7 +182,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
       c: c_,
       c0: c0_,
       useSafeAdditions = true,
-    }: { c?: number; c0?: number; useSafeAdditions?: boolean } | undefined = {}
+    }: { c?: number; c0?: number; useSafeAdditions?: boolean } | undefined = {},
   ) {
     let result = getPointer(sizeProjective);
     let memoryOffset = Field.getOffset();
@@ -522,7 +528,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
   function reduceBucketsAffine(
     scratch: number[],
     oldBuckets: number[][],
-    { c, c0, K, L }: { c: number; c0: number; K: number; L: number }
+    { c, c0, K, L }: { c: number; c0: number; K: number; L: number },
   ) {
     // D = 1 is the standard algorithm, just batch-added over the K partitions
     // D > 1 means that we're doing D * K = n adds at a time
@@ -575,7 +581,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
         nextBuckets,
         nextBuckets,
         runningSums,
-        n
+        n,
       );
     }
 
@@ -604,7 +610,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
         majorSums,
         majorSums,
         minorSums,
-        p
+        p,
       );
     }
     // second logarithmic step: repeated doubling of some buckets until they hold square areas to fill up the triangle
@@ -675,7 +681,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
    */
   function toAffineOutputBigint(
     [zinv, ...scratch]: number[],
-    point: number
+    point: number,
   ): BigintPoint {
     if (isZeroProjective(point)) {
       return { x: 0n, y: 0n, isZero: true };
@@ -696,7 +702,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
       s: number,
       p: number,
       N: number,
-      o?: { c?: number; c0?: number }
+      o?: { c?: number; c0?: number },
     ) => msm(s, p, N, { ...o, useSafeAdditions: false }),
     msmBigint,
     batchAdd,
@@ -706,7 +712,7 @@ function createMsm({ Field, Scalar, Affine, Projective }: MsmCurve) {
 
 function bigintPointsToMemory(
   { getPointer, sizeField, writeBigint, memoryBytes, toMontgomery }: MsmField,
-  inputPoints: BigintPoint[]
+  inputPoints: BigintPoint[],
 ) {
   let N = inputPoints.length;
   let sizeAffine = getSizeAffine(sizeField);
@@ -734,7 +740,7 @@ function bigintPointsToMemory(
 
 function bigintScalarsToMemory(
   { sizeField: sizeScalar, getPointer, writeBigint }: GlvScalar,
-  inputScalars: bigint[]
+  inputScalars: bigint[],
 ) {
   let N = inputScalars.length;
   let scalarPtr = getPointer(N * sizeScalar);
