@@ -11,7 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Pallas, Vesta } from "./index.ts";
+import { Pallas, Vesta, startThreads, stopThreads } from "./index.ts";
 import { type CurveParams } from "./bigint/affine-weierstrass.ts";
 
 type Weierstraß = Awaited<ReturnType<typeof Pallas>>;
@@ -54,6 +54,26 @@ test("Sync.msmAffineBytes rejects malformed input", () => {
     () => pallas.Sync.msmAffineBytes(new Uint8Array(128), new Uint8Array(32)),
     /point\/scalar count mismatch/,
   );
+});
+
+test("Sync vs Parallel (async) parity for Pallas + Vesta", async () => {
+  await startThreads(2);
+  try {
+    for (let C of [pallas, vesta]) {
+      for (let N of [0, 1, 2, 8, 1024]) {
+        let { pointsBytes, scalarBytes } = randomInputBytes(C, N);
+        let syncOut = C.Sync.msmAffineBytes(pointsBytes, scalarBytes);
+        let asyncOut = await asyncMsmBytes(C, pointsBytes, scalarBytes);
+        assert.deepEqual(
+          [...syncOut],
+          [...asyncOut],
+          `${C.params.label} N=${N}: sync output != async output`,
+        );
+      }
+    }
+  } finally {
+    await stopThreads();
+  }
 });
 
 test("perf smoke: 2^10 and 2^14 (Pallas)", async () => {
@@ -166,6 +186,43 @@ function decodeForBigint(
     );
   }
   return { points, scalars };
+}
+
+async function asyncMsmBytes(
+  C: Weierstraß,
+  pointsBytes: Uint8Array,
+  scalarBytes: Uint8Array,
+): Promise<Uint8Array> {
+  let { Field, Scalar, Affine, Projective, Parallel, Bigint } = C;
+  let bytesPerPoint = 2 * Field.packedSizeField;
+  let packedScalar = Scalar.packedSizeField;
+  let N = pointsBytes.length / bytesPerPoint;
+
+  let out = new Uint8Array(bytesPerPoint);
+  if (N === 0) return out;
+
+  // copy bytes into wasm and decode (mirroring Sync.msmAffineBytes)
+  let pointsInputPtr = await Parallel.getPointer(N * bytesPerPoint);
+  Field.memoryBytes.set(pointsBytes, pointsInputPtr);
+  let scalarsInputPtr = await Parallel.getScalarPointer(N * packedScalar);
+  Scalar.memoryBytes.set(scalarBytes, scalarsInputPtr);
+
+  let pointPtr = await Parallel.getPointer(N * Affine.size);
+  await Parallel.pointsFromBytes(pointPtr, pointsInputPtr, N);
+  let scalarPtr = await Parallel.getScalarPointer(N * Scalar.sizeField);
+  await Parallel.scalarsFromBytes(scalarPtr, scalarsInputPtr, N);
+
+  // run async parallel msm
+  let { result } = await Parallel.msm(scalarPtr, pointPtr, N);
+
+  // pack result to LE bytes via Bigint helpers (no shared mem with the wasm
+  // pointer slots used above)
+  let projBigint = Projective.toBigint(result);
+  let aff = Bigint.Projective.toAffine(projBigint);
+  if (aff.isZero) return out;
+  bigintToBytesLE(aff.x, out, 0, Field.packedSizeField);
+  bigintToBytesLE(aff.y, out, Field.packedSizeField, Field.packedSizeField);
+  return out;
 }
 
 function bigintToBytesLE(x: bigint, out: Uint8Array, off: number, len: number) {
