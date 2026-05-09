@@ -38,6 +38,57 @@ test("Sync.msmAffineBytes returns Uint8Array, not a Promise", () => {
   assert.equal(typeof (out as any).then, "undefined", "must not be a Promise");
 });
 
+test("Pallas Sync.msmAffineBytesBatch parity vs repeated single calls", () => {
+  for (let sizes of [[], [0], [1], [0, 1, 2, 17, 256, 4096], [4096, 4096, 4096]]) {
+    checkBatchParity(pallas, sizes);
+  }
+});
+
+test("Vesta Sync.msmAffineBytesBatch parity vs repeated single calls", () => {
+  for (let sizes of [[], [0], [1], [0, 1, 2, 17, 256, 4096]]) {
+    checkBatchParity(vesta, sizes);
+  }
+});
+
+test("Sync.msmAffineBytesBatch o1js shape (Pallas, 30x4096 + 30x256)", () => {
+  let sizes = [
+    ...Array(30).fill(4096),
+    ...Array(30).fill(256),
+  ];
+  checkBatchParity(pallas, sizes);
+});
+
+test("Sync.msmAffineBytesBatch rejects malformed input", () => {
+  assert.throws(
+    () => pallas.Sync.msmAffineBytesBatch(new Uint8Array(0), new Uint8Array(0), [-1]),
+    /sizes\[0\] must be a non-negative integer/,
+  );
+  assert.throws(
+    () => pallas.Sync.msmAffineBytesBatch(new Uint8Array(0), new Uint8Array(0), [1.5]),
+    /sizes\[0\] must be a non-negative integer/,
+  );
+  // declared 2 points but bytes only fit 1
+  assert.throws(
+    () => pallas.Sync.msmAffineBytesBatch(new Uint8Array(64), new Uint8Array(64), [1, 1]),
+    /pointsBytes\.length === sum\(sizes\)\*64 = 128, got 64/,
+  );
+  assert.throws(
+    () => pallas.Sync.msmAffineBytesBatch(new Uint8Array(128), new Uint8Array(32), [1, 1]),
+    /scalarBytes\.length === sum\(sizes\)\*32 = 64, got 32/,
+  );
+});
+
+test("Sync.msmAffineBytesBatch with empty batch returns empty Uint8Array", () => {
+  let out = pallas.Sync.msmAffineBytesBatch(new Uint8Array(0), new Uint8Array(0), []);
+  assert.ok(out instanceof Uint8Array);
+  assert.equal(out.length, 0);
+});
+
+test("Sync.msmAffineBytesBatch returns Uint8Array, not a Promise", () => {
+  let out = pallas.Sync.msmAffineBytesBatch(new Uint8Array(0), new Uint8Array(0), []);
+  assert.equal(typeof (out as any).then, "undefined");
+});
+
 test("Sync.msmAffineBytes rejects malformed input", () => {
   // points length not a multiple of 64
   assert.throws(
@@ -110,6 +161,42 @@ test("perf smoke: 2^10 and 2^14 (Pallas)", async () => {
 });
 
 // helpers
+
+function checkBatchParity(C: Weierstraß, sizes: number[]) {
+  let totalN = sizes.reduce((a, b) => a + b, 0);
+  let pointsBytes = new Uint8Array(totalN * 64);
+  let scalarBytes = new Uint8Array(totalN * 32);
+
+  // populate from random per-batch inputs
+  let pOff = 0;
+  let sOff = 0;
+  let perBatch: { pts: Uint8Array; scs: Uint8Array }[] = [];
+  for (let n of sizes) {
+    let { pointsBytes: p, scalarBytes: s } = randomInputBytes(C, n);
+    pointsBytes.set(p, pOff);
+    scalarBytes.set(s, sOff);
+    perBatch.push({ pts: p, scs: s });
+    pOff += n * 64;
+    sOff += n * 32;
+  }
+
+  let batchOut = C.Sync.msmAffineBytesBatch(pointsBytes, scalarBytes, sizes);
+  assert.equal(batchOut.length, sizes.length * 64);
+
+  // expected: concatenate single-call results
+  let expected = new Uint8Array(sizes.length * 64);
+  for (let i = 0; i < sizes.length; i++) {
+    let { pts, scs } = perBatch[i];
+    let one = C.Sync.msmAffineBytes(pts, scs);
+    expected.set(one, i * 64);
+  }
+
+  assert.deepEqual(
+    [...batchOut],
+    [...expected],
+    `${C.params.label} batch sizes=${JSON.stringify(sizes)}: batch != repeated single calls`,
+  );
+}
 
 async function checkParity(C: Weierstraß, N: number) {
   let { pointsBytes, scalarBytes, points, scalars } = randomInputs(C, N);

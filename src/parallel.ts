@@ -191,6 +191,95 @@ async function createWeierstraß(
   }
 
   /**
+   * Run one synchronous MSM. Writes 64 output bytes (or `bytesPerPoint`,
+   * whichever applies) into `out` at `outOffset`. Caller validates inputs
+   * and zero-initializes the output region (we only write on success;
+   * infinity / N=0 leaves the region as-is).
+   *
+   * Wraps allocations in `using` scopes so wasm memory is released on
+   * return. Safe to call repeatedly with no global state leakage.
+   */
+  function runOneSync(
+    points: Uint8Array,
+    scalars: Uint8Array,
+    N: number,
+    out: Uint8Array,
+    outOffset: number,
+  ): void {
+    if (N === 0) return;
+
+    let packedField = Field.packedSizeField;
+    let packedScalar = Scalar.packedSizeField;
+    let bytesPerPoint = 2 * packedField;
+
+    using _g = Field.global.atCurrentOffset;
+    using _l = Field.local.atCurrentOffset;
+    using _s = Scalar.global.atCurrentOffset;
+
+    // copy input bytes into wasm memory
+    let pointsInputPtr = Field.global.getPointer(N * bytesPerPoint);
+    Field.memoryBytes.set(points, pointsInputPtr);
+    let scalarsInputPtr = Scalar.global.getPointer(N * packedScalar);
+    Scalar.memoryBytes.set(scalars, scalarsInputPtr);
+
+    // decode into the on-curve internal layout (Montgomery form for points).
+    // we don't use `pointsFromBytes` / `scalarsFromBytes` here — those use
+    // `range(N)` to partition across threads and would only process this
+    // thread's slice. the sync API runs on the main thread alone, so we
+    // walk the full [0, N) range explicitly.
+    let pointPtr = Field.global.getPointer(N * Affine.size);
+    let scalarPtr = Scalar.global.getPointer(N * Scalar.sizeField);
+    let sizeAffineLocal = Affine.size;
+    for (
+      let i = 0,
+        pi = pointPtr,
+        bi = pointsInputPtr;
+      i < N;
+      i++, pi += sizeAffineLocal, bi += bytesPerPoint
+    ) {
+      let x = pi;
+      let y = x + Field.sizeField;
+      Field.memoryBytes[pi + 2 * Field.sizeField] = 1;
+      Field.fromPackedBytes(x, bi);
+      Field.fromPackedBytes(y, bi + packedField);
+      Field.toMontgomery(x);
+      Field.toMontgomery(y);
+    }
+    for (
+      let i = 0,
+        si = scalarPtr,
+        bi = scalarsInputPtr;
+      i < N;
+      i++, si += Scalar.sizeField, bi += packedScalar
+    ) {
+      Scalar.fromPackedBytes(si, bi);
+    }
+
+    // run the optimized single-thread MSM (synchronous)
+    let resultProjective = msmSync(scalarPtr, pointPtr, N);
+
+    if (Projective.isZero(resultProjective)) return;
+
+    // projective -> affine, then pack to LE bytes
+    let scratch = Field.local.getPointers(5);
+    let [x, y, z] = Projective.coords(resultProjective);
+    let zinv = scratch[0];
+    Field.inverse(scratch[1], zinv, z);
+    Field.multiply(x, x, zinv);
+    Field.multiply(y, y, zinv);
+    Field.fromMontgomery(x);
+    Field.fromMontgomery(y);
+
+    let outPtr = Field.global.getPointer(bytesPerPoint);
+    Field.toPackedBytes(outPtr, x);
+    Field.toPackedBytes(outPtr + packedField, y);
+    out.set(
+      Field.memoryBytes.subarray(outPtr, outPtr + bytesPerPoint),
+      outOffset,
+    );
+  }
+
+  /**
    * Synchronous MSM
    *
    * Inputs:
@@ -230,74 +319,82 @@ async function createWeierstraß(
     );
 
     let out = new Uint8Array(bytesPerPoint);
-    if (N === 0) return out;
-
-    using _g = Field.global.atCurrentOffset;
-    using _l = Field.local.atCurrentOffset;
-    using _s = Scalar.global.atCurrentOffset;
-
-    // copy input bytes into wasm memory
-    let pointsInputPtr = Field.global.getPointer(N * bytesPerPoint);
-    Field.memoryBytes.set(pointsBytes, pointsInputPtr);
-    let scalarsInputPtr = Scalar.global.getPointer(N * packedScalar);
-    Scalar.memoryBytes.set(scalarBytes, scalarsInputPtr);
-
-    // decode into the on-curve internal layout (Montgomery form for points).
-    // we don't use `pointsFromBytes` / `scalarsFromBytes` here — those use
-    // `range(N)` to partition across threads and would only process this
-    // thread's slice. the sync API runs on the main thread alone, so we
-    // walk the full [0, N) range explicitly.
-    let pointPtr = Field.global.getPointer(N * Affine.size);
-    let scalarPtr = Scalar.global.getPointer(N * Scalar.sizeField);
-    let sizeAffineLocal = Affine.size;
-    for (
-      let i = 0,
-        pi = pointPtr,
-        bi = pointsInputPtr;
-      i < N;
-      i++, pi += sizeAffineLocal, bi += bytesPerPoint
-    ) {
-      let x = pi;
-      let y = x + Field.sizeField;
-      Field.memoryBytes[pi + 2 * Field.sizeField] = 1;
-      Field.fromPackedBytes(x, bi);
-      Field.fromPackedBytes(y, bi + packedField);
-      Field.toMontgomery(x);
-      Field.toMontgomery(y);
-    }
-    for (
-      let i = 0,
-        si = scalarPtr,
-        bi = scalarsInputPtr;
-      i < N;
-      i++, si += Scalar.sizeField, bi += packedScalar
-    ) {
-      Scalar.fromPackedBytes(si, bi);
-    }
-
-    // run the optimized single-thread MSM (synchronous)
-    let resultProjective = msmSync(scalarPtr, pointPtr, N);
-
-    if (Projective.isZero(resultProjective)) return out;
-
-    // projective -> affine, then pack to LE bytes
-    let scratch = Field.local.getPointers(5);
-    let [x, y, z] = Projective.coords(resultProjective);
-    let zinv = scratch[0];
-    Field.inverse(scratch[1], zinv, z);
-    Field.multiply(x, x, zinv);
-    Field.multiply(y, y, zinv);
-    Field.fromMontgomery(x);
-    Field.fromMontgomery(y);
-
-    let outPtr = Field.global.getPointer(bytesPerPoint);
-    Field.toPackedBytes(outPtr, x);
-    Field.toPackedBytes(outPtr + packedField, y);
-    out.set(Field.memoryBytes.subarray(outPtr, outPtr + bytesPerPoint));
+    runOneSync(pointsBytes, scalarBytes, N, out, 0);
     return out;
   }
 
-  const Sync = { msmAffineBytes };
+  /**
+   * Batched synchronous MSM. Runs `sizes.length` MSMs in one JS call,
+   * amortizing the cross-language boundary overhead.
+   *
+   * Inputs:
+   * - `pointsBytes`: all MSM points concatenated, in the same per-MSM
+   *   layout as {@link msmAffineBytes}. Total length must equal
+   *   `sum(sizes) * 2 * packedSizeField`.
+   * - `scalarBytes`: all MSM scalars concatenated. Total length must
+   *   equal `sum(sizes) * packedSizeField`.
+   * - `sizes`: number of points/scalars in each sub-MSM (non-negative
+   *   integers). `sizes[i] === 0` produces an all-zero 64-byte output
+   *   slot, matching {@link msmAffineBytes}'s infinity convention.
+   *
+   * Output: `sizes.length * 64` bytes for Pasta — the 64-byte affine
+   * results concatenated in input order.
+   *
+   * Each sub-MSM still uses its own scoped wasm allocations, so memory
+   * doesn't accumulate across many calls in one batch.
+   */
+  function msmAffineBytesBatch(
+    pointsBytes: Uint8Array,
+    scalarBytes: Uint8Array,
+    sizes: Uint32Array | number[],
+  ): Uint8Array {
+    let packedField = Field.packedSizeField;
+    let packedScalar = Scalar.packedSizeField;
+    let bytesPerPoint = 2 * packedField;
+    let nBatches = sizes.length;
+
+    let totalN = 0;
+    for (let i = 0; i < nBatches; i++) {
+      let n = sizes[i];
+      assert(
+        Number.isInteger(n) && n >= 0,
+        `msmAffineBytesBatch: sizes[${i}] must be a non-negative integer, got ${n}`,
+      );
+      totalN += n;
+    }
+    assert(
+      pointsBytes.length === totalN * bytesPerPoint,
+      `msmAffineBytesBatch: expected pointsBytes.length === sum(sizes)*${bytesPerPoint} = ${totalN * bytesPerPoint}, got ${pointsBytes.length}`,
+    );
+    assert(
+      scalarBytes.length === totalN * packedScalar,
+      `msmAffineBytesBatch: expected scalarBytes.length === sum(sizes)*${packedScalar} = ${totalN * packedScalar}, got ${scalarBytes.length}`,
+    );
+
+    let out = new Uint8Array(nBatches * bytesPerPoint);
+
+    let pointsOffset = 0;
+    let scalarOffset = 0;
+    for (let i = 0; i < nBatches; i++) {
+      let N = sizes[i];
+      if (N > 0) {
+        let pView = pointsBytes.subarray(
+          pointsOffset,
+          pointsOffset + N * bytesPerPoint,
+        );
+        let sView = scalarBytes.subarray(
+          scalarOffset,
+          scalarOffset + N * packedScalar,
+        );
+        runOneSync(pView, sView, N, out, i * bytesPerPoint);
+      }
+      pointsOffset += N * bytesPerPoint;
+      scalarOffset += N * packedScalar;
+    }
+    return out;
+  }
+
+  const Sync = { msmAffineBytes, msmAffineBytesBatch };
 
   const Parallel = pool.register(`Weierstraß, ${label}`, {
     randomPointsFast,
