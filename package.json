@@ -37,7 +37,8 @@
     "benchmark": "node scripts/field-benchmarks/pallas.ts",
     "benchmark-377": "node scripts/field-benchmarks/377.ts",
     "benchmark-381": "node scripts/field-benchmarks/381.ts",
-    "prepublishOnly": "npm run clean && npm run build && node scripts/build/bundle-dist-web.ts",
+    "prepare": "npm run clean && npm run build && node scripts/build/bundle-dist-web.ts",
+    "prepublishOnly": "npm run prepare",
     "clean": "rm -rf build"
   },
   "keywords": [],
